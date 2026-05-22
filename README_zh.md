@@ -108,4 +108,4 @@ target/release/Dehydrator4Win.exe --headless
 ---
 
 ## 许可证
-基于 MIT 许可证开源，欢迎大家提 PR 或 Issue 共同改进！
+基于 Apache License 2.0 许可证开源，欢迎大家提 PR 或 Issue 共同改进！

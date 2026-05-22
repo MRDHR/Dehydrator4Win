@@ -108,4 +108,4 @@ This runs the MCP server on stdio and starts the 127.0.0.1:3001 TCP host without
 ---
 
 ## License
-Licensed under the MIT License. Feel free to contribute or submit PRs!
+Licensed under the Apache License 2.0. Feel free to contribute or submit PRs!
