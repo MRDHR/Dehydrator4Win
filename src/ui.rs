@@ -819,12 +819,14 @@ impl DehydratorApp {
                     .size(12)
                     .font(iced::Font::MONOSPACE)
                     .color(color)
+                    .width(Length::Fill)
             );
         }
 
         let log_box = container(
             scrollable(
-                container(log_col)
+                container(log_col.width(Length::Fill))
+                    .width(Length::Fill)
                     .padding(iced::Padding {
                         top: 10.0,
                         bottom: 10.0,
@@ -832,6 +834,9 @@ impl DehydratorApp {
                         right: 15.0,
                     })
             )
+            .direction(scrollable::Direction::Vertical(
+                scrollable::Scrollbar::new().width(6).scroller_width(6)
+            ))
             .height(Length::Fill)
         )
         .width(Length::Fill)
