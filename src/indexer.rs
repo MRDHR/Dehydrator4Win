@@ -1,5 +1,5 @@
 use crate::config::Profile;
-use crate::storage::CodeGraph;
+use crate::storage::{CodeGraph, SymbolData};
 use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
 use regex::Regex;
@@ -89,13 +89,231 @@ fn clean_line_for_braces(line: &str) -> String {
     re_char.replace_all(&without_str, "''").into_owned()
 }
 
-/// 代码脱水算法：按行读取文件，将大括号或缩进内函数体抹除，仅保留签名，返回脱水后的文本与提取出的符号列表。
+/// 代码脱水算法：将大括号或缩进内函数体抹除，仅保留签名，返回脱水后的文本与提取出的符号列表。
 pub fn generate_skeleton_by_regex(content: &str, ext: &str) -> (String, Vec<ParsedSymbol>) {
-    if ext == "py" {
-        generate_skeleton_python(content)
+    if ext == "rs" {
+        generate_skeleton_tree_sitter_rust(content)
+    } else if ext == "py" {
+        generate_skeleton_tree_sitter_python(content)
     } else {
         generate_skeleton_curly_brace(content, ext)
     }
+}
+
+fn collect_rust_symbols(
+    node: tree_sitter::Node,
+    content: &str,
+    symbols: &mut Vec<ParsedSymbol>,
+    dehydrate_ranges: &mut Vec<(usize, usize, String)>,
+    in_function: bool,
+) {
+    let kind = node.kind();
+    let mut next_in_function = in_function;
+
+    match kind {
+        "function_item" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = name_node.utf8_text(content.as_bytes()).unwrap_or("").to_string();
+                let start_line = node.start_position().row + 1;
+                let end_line = node.end_position().row + 1;
+
+                let signature = if let Some(body_node) = node.child_by_field_name("body") {
+                    let sig_end = body_node.start_byte() + 1;
+                    content.get(node.start_byte()..sig_end).unwrap_or("").trim_end().to_string()
+                } else {
+                    node.utf8_text(content.as_bytes()).unwrap_or("").to_string()
+                };
+
+                symbols.push(ParsedSymbol {
+                    name,
+                    kind: "function".to_string(),
+                    start_line,
+                    end_line,
+                    signature,
+                });
+
+                if !in_function {
+                    if let Some(body_node) = node.child_by_field_name("body") {
+                        let body_start = body_node.start_byte() + 1;
+                        let body_end = body_node.end_byte().saturating_sub(1);
+                        if body_end > body_start {
+                            let indent = content.lines().nth(node.start_position().row).unwrap_or("").chars().take_while(|c| c.is_whitespace()).collect::<String>();
+                            let replacement = format!("\n{}    // [Implementation hidden by Dehydrator4Win to save Token]\n{}", indent, indent);
+                            dehydrate_ranges.push((body_start, body_end, replacement));
+                        }
+                    }
+                }
+                next_in_function = true;
+            }
+        }
+        "struct_item" | "enum_item" | "trait_item" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = name_node.utf8_text(content.as_bytes()).unwrap_or("").to_string();
+                let start_line = node.start_position().row + 1;
+                let end_line = node.end_position().row + 1;
+
+                let kind_str = match kind {
+                    "trait_item" => "interface",
+                    _ => "struct",
+                };
+
+                let signature = content.lines().nth(node.start_position().row).unwrap_or("").trim_end().to_string();
+
+                symbols.push(ParsedSymbol {
+                    name,
+                    kind: kind_str.to_string(),
+                    start_line,
+                    end_line,
+                    signature,
+                });
+            }
+        }
+        _ => {}
+    }
+
+    // 递归遍历子节点
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            collect_rust_symbols(cursor.node(), content, symbols, dehydrate_ranges, next_in_function);
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+}
+
+fn collect_python_symbols(
+    node: tree_sitter::Node,
+    content: &str,
+    symbols: &mut Vec<ParsedSymbol>,
+    dehydrate_ranges: &mut Vec<(usize, usize, String)>,
+    in_function: bool,
+) {
+    let kind = node.kind();
+    let mut next_in_function = in_function;
+
+    match kind {
+        "function_definition" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = name_node.utf8_text(content.as_bytes()).unwrap_or("").to_string();
+                let start_line = node.start_position().row + 1;
+                let end_line = node.end_position().row + 1;
+
+                let signature = if let Some(body_node) = node.child_by_field_name("body") {
+                    content.get(node.start_byte()..body_node.start_byte()).unwrap_or("").trim_end().to_string()
+                } else {
+                    node.utf8_text(content.as_bytes()).unwrap_or("").to_string()
+                };
+
+                symbols.push(ParsedSymbol {
+                    name,
+                    kind: "function".to_string(),
+                    start_line,
+                    end_line,
+                    signature,
+                });
+
+                if !in_function {
+                    if let Some(body_node) = node.child_by_field_name("body") {
+                        let body_start = body_node.start_byte();
+                        let body_end = body_node.end_byte();
+                        if body_end > body_start {
+                            let indent = content.lines().nth(node.start_position().row).unwrap_or("").chars().take_while(|c| c.is_whitespace()).collect::<String>();
+                            let replacement = format!("\n{}    # [Implementation hidden by Dehydrator4Win to save Token]", indent);
+                            dehydrate_ranges.push((body_start, body_end, replacement));
+                        }
+                    }
+                }
+                next_in_function = true;
+            }
+        }
+        "class_definition" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = name_node.utf8_text(content.as_bytes()).unwrap_or("").to_string();
+                let start_line = node.start_position().row + 1;
+                let end_line = node.end_position().row + 1;
+
+                let signature = if let Some(body_node) = node.child_by_field_name("body") {
+                    content.get(node.start_byte()..body_node.start_byte()).unwrap_or("").trim_end().to_string()
+                } else {
+                    node.utf8_text(content.as_bytes()).unwrap_or("").to_string()
+                };
+
+                symbols.push(ParsedSymbol {
+                    name,
+                    kind: "class".to_string(),
+                    start_line,
+                    end_line,
+                    signature,
+                });
+            }
+        }
+        _ => {}
+    }
+
+    // 递归遍历子节点
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            collect_python_symbols(cursor.node(), content, symbols, dehydrate_ranges, next_in_function);
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+}
+
+fn generate_skeleton_tree_sitter_rust(content: &str) -> (String, Vec<ParsedSymbol>) {
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(tree_sitter_rust::language()).expect("Failed to load Rust grammar");
+    let tree = match parser.parse(content, None) {
+        Some(t) => t,
+        None => return (content.to_string(), Vec::new()),
+    };
+
+    let mut symbols = Vec::new();
+    let mut dehydrate_ranges = Vec::new();
+
+    collect_rust_symbols(tree.root_node(), content, &mut symbols, &mut dehydrate_ranges, false);
+
+    // 从后往前排序，避免修改索引偏移
+    dehydrate_ranges.sort_by_key(|r| std::cmp::Reverse(r.0));
+
+    let mut dehydrated = content.to_string();
+    for (start, end, replacement) in dehydrate_ranges {
+        if start <= dehydrated.len() && end <= dehydrated.len() && start <= end {
+            dehydrated.replace_range(start..end, &replacement);
+        }
+    }
+
+    (dehydrated, symbols)
+}
+
+fn generate_skeleton_tree_sitter_python(content: &str) -> (String, Vec<ParsedSymbol>) {
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(tree_sitter_python::language()).expect("Failed to load Python grammar");
+    let tree = match parser.parse(content, None) {
+        Some(t) => t,
+        None => return (content.to_string(), Vec::new()),
+    };
+
+    let mut symbols = Vec::new();
+    let mut dehydrate_ranges = Vec::new();
+
+    collect_python_symbols(tree.root_node(), content, &mut symbols, &mut dehydrate_ranges, false);
+
+    // 从后往前排序，避免修改索引偏移
+    dehydrate_ranges.sort_by_key(|r| std::cmp::Reverse(r.0));
+
+    let mut dehydrated = content.to_string();
+    for (start, end, replacement) in dehydrate_ranges {
+        if start <= dehydrated.len() && end <= dehydrated.len() && start <= end {
+            dehydrated.replace_range(start..end, &replacement);
+        }
+    }
+
+    (dehydrated, symbols)
 }
 
 fn generate_skeleton_curly_brace(content: &str, ext: &str) -> (String, Vec<ParsedSymbol>) {
@@ -321,153 +539,6 @@ fn generate_skeleton_curly_brace(content: &str, ext: &str) -> (String, Vec<Parse
     (output, symbols)
 }
 
-fn generate_skeleton_python(content: &str) -> (String, Vec<ParsedSymbol>) {
-    let mut output = String::new();
-    let mut symbols = Vec::new();
-
-    struct DehydratingFuncPy {
-        name: String,
-        kind: String,
-        start_line: usize,
-        signature: String,
-        base_indent: usize,
-        has_hidden_placeholder: bool,
-        last_non_empty_line: usize,
-    }
-
-    struct ActiveContainerPy {
-        base_indent: usize,
-        symbol_index: usize,
-    }
-
-    let mut dehydrating_func: Option<DehydratingFuncPy> = None;
-    let mut active_containers: Vec<ActiveContainerPy> = Vec::new();
-
-    let mut last_non_empty_line = 0;
-    let lines: Vec<&str> = content.lines().collect();
-    let mut i = 0;
-
-    while i < lines.len() {
-        let raw_line = lines[i];
-        let is_empty = raw_line.trim().is_empty();
-        let is_comment = raw_line.trim().starts_with('#');
-
-        if let Some(mut func) = dehydrating_func.take() {
-            if is_empty || is_comment {
-                output.push_str(raw_line);
-                output.push('\n');
-                dehydrating_func = Some(func);
-            } else {
-                let current_indent = raw_line.chars().take_while(|c| c.is_whitespace() || *c == '\t').count();
-                if current_indent > func.base_indent {
-                    func.last_non_empty_line = i + 1;
-                    if !func.has_hidden_placeholder {
-                        let indent = " ".repeat(func.base_indent + 4);
-                        output.push_str(&format!("{}# [Implementation hidden by Dehydrator4Win to save Token]\n", indent));
-                        func.has_hidden_placeholder = true;
-                    }
-                    dehydrating_func = Some(func);
-                } else {
-                    symbols.push(ParsedSymbol {
-                        name: func.name,
-                        kind: func.kind,
-                        start_line: func.start_line,
-                        end_line: func.last_non_empty_line,
-                        signature: func.signature,
-                    });
-                    dehydrating_func = None;
-                    i -= 1;
-                }
-            }
-            i += 1;
-            continue;
-        }
-
-        if !is_empty && !is_comment {
-            let current_indent = raw_line.chars().take_while(|c| c.is_whitespace() || *c == '\t').count();
-            let mut still_active = Vec::new();
-            for container in active_containers {
-                if current_indent <= container.base_indent {
-                    symbols[container.symbol_index].end_line = last_non_empty_line;
-                } else {
-                    still_active.push(container);
-                }
-            }
-            active_containers = still_active;
-        }
-
-        if !is_empty && !is_comment {
-            last_non_empty_line = i + 1;
-        }
-
-        let mut matched = false;
-        if !is_empty && !is_comment {
-            let lang_config = get_lang_regexes("py");
-            for (re, kind) in &lang_config.patterns {
-                if let Some(caps) = re.captures(raw_line) {
-                    if let Some(name_match) = caps.get(1) {
-                        let name = name_match.as_str().to_string();
-                        let signature = raw_line.trim().to_string();
-                        let start_line = i + 1;
-                        let base_indent = raw_line.chars().take_while(|c| c.is_whitespace() || *c == '\t').count();
-
-                        if *kind == "function" {
-                            dehydrating_func = Some(DehydratingFuncPy {
-                                name,
-                                kind: kind.to_string(),
-                                start_line,
-                                signature,
-                                base_indent,
-                                has_hidden_placeholder: false,
-                                last_non_empty_line: start_line,
-                            });
-                        } else {
-                            let symbol_index = symbols.len();
-                            symbols.push(ParsedSymbol {
-                                name: name.clone(),
-                                kind: kind.to_string(),
-                                start_line,
-                                end_line: start_line,
-                                signature: signature.clone(),
-                            });
-                            active_containers.push(ActiveContainerPy {
-                                base_indent,
-                                symbol_index,
-                            });
-                        }
-                        output.push_str(raw_line);
-                        output.push('\n');
-                        matched = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if !matched {
-            output.push_str(raw_line);
-            output.push('\n');
-        }
-
-        i += 1;
-    }
-
-    if let Some(func) = dehydrating_func {
-        symbols.push(ParsedSymbol {
-            name: func.name,
-            kind: func.kind,
-            start_line: func.start_line,
-            end_line: func.last_non_empty_line,
-            signature: func.signature,
-        });
-    }
-    for container in active_containers {
-        symbols[container.symbol_index].end_line = last_non_empty_line;
-    }
-
-    (output, symbols)
-}
-
 
 /// 判断是否是关键字
 fn is_not_keyword(word: &str) -> bool {
@@ -486,7 +557,7 @@ fn is_not_keyword(word: &str) -> bool {
     !kw.contains(word) && word.len() > 1
 }
 
-fn is_supported_extension(ext: &str) -> bool {
+pub fn is_supported_extension(ext: &str) -> bool {
     let ext_lower = ext.to_lowercase();
     match ext_lower.as_str() {
         "rs" | "go" | "js" | "ts" | "jsx" | "tsx" | "py" | "java" | "kt" |
@@ -498,7 +569,7 @@ fn is_supported_extension(ext: &str) -> bool {
 }
 
 /// 文件处理函数，用于从磁盘提取符号并写入数据库
-fn process_file(
+pub fn process_file(
     db: &CodeGraph,
     profile_name: &str,
     path: &Path,
@@ -538,23 +609,14 @@ fn process_file(
         };
         let (_, parsed_symbols) = generate_skeleton_by_regex(&content, ext);
 
-        let file_id = db.upsert_file(profile_name, path_str, last_modified)?;
-        db.clear_file_symbols(file_id)?;
-
         let content_lines: Vec<&str> = content.lines().collect();
         let word_re = Regex::new(r"\b[a-zA-Z_]\w*\b")?;
 
-        for sym in parsed_symbols {
-            let sym_id = db.insert_symbol(
-                file_id,
-                &sym.name,
-                &sym.kind,
-                sym.start_line as i32,
-                sym.end_line as i32,
-                &sym.signature,
-            )?;
+        let mut symbols_data = Vec::new();
 
+        for sym in parsed_symbols {
             // 分析代码体提取单词依赖
+            let mut references = Vec::new();
             if sym.start_line > 0 && sym.end_line >= sym.start_line && sym.end_line <= content_lines.len() {
                 let mut words_in_sym = HashSet::new();
                 for line_idx in (sym.start_line - 1)..sym.end_line {
@@ -569,11 +631,22 @@ fn process_file(
 
                 for target_name in words_in_sym {
                     if is_not_keyword(&target_name) {
-                        db.insert_reference(sym_id, &target_name)?;
+                        references.push(target_name);
                     }
                 }
             }
+
+            symbols_data.push(SymbolData {
+                name: sym.name,
+                kind: sym.kind,
+                start_line: sym.start_line as i32,
+                end_line: sym.end_line as i32,
+                signature: sym.signature,
+                references,
+            });
         }
+
+        db.save_file_symbols(profile_name, path_str, last_modified, symbols_data)?;
     }
 
     Ok(())
@@ -637,6 +710,30 @@ impl Indexer {
 
         Ok(())
     }
+}
+
+pub const CORE_SKILL_MARKDOWN: &str = r#"# Dehydrator4Win Context Optimization Contract
+1. 强制规范：若目标源文件代码行数超过 150 行，Agent 禁止直接调用全量文件读取工具。
+2. 降维探索：Agent 必须首先调用 `dehydrator4win:read_skeleton` 提取抽象骨架。
+3. 精准加水：精准定位发生 Bug 的方法级命名空间后，通过 `dehydrator4win:hydrate_symbols` 局部定向拉取函数体。
+"#;
+
+pub fn inject_skills(workspace_path: &std::path::Path) -> Result<(), std::io::Error> {
+    let targets = vec![
+        (".codex/skills", "dehydrator.md"),
+        (".claude", "custom_rules.md"),
+        (".gemini", "instructions.md"),
+        (".agent/skills", "dehydrator.md"),
+    ];
+
+    for (dir, file) in targets {
+        let dir_path = workspace_path.join(dir);
+        std::fs::create_dir_all(&dir_path)?;
+        let file_path = dir_path.join(file);
+        std::fs::write(&file_path, CORE_SKILL_MARKDOWN)?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -760,5 +857,12 @@ class Calculator:
 
         // 清理临时目录
         let _ = std::fs::remove_dir_all(&workspace_path);
+    }
+
+    #[test]
+    fn test_tree_sitter_loading() {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(tree_sitter_rust::language()).unwrap();
+        parser.set_language(tree_sitter_python::language()).unwrap();
     }
 }

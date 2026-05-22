@@ -1,8 +1,13 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 pub mod config;
 pub mod storage;
 pub mod indexer;
 pub mod mcp;
 pub mod ui;
+pub mod watcher;
+pub mod debug_scan;
+pub mod chart;
 
 use std::sync::Arc;
 
@@ -12,6 +17,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. 命令行参数解析
     let args: Vec<String> = std::env::args().collect();
     let headless = args.contains(&"--headless".to_string());
+    
+    if args.contains(&"--debug-scan".to_string()) {
+        return debug_scan::run_debug_scan();
+    }
 
     // 2. 查找或就地创建 config 目录并加载所有的 profile
     let config_dir = std::env::current_dir()?.join("config");
@@ -81,6 +90,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 4. 创建共享配置指针和消息通道
     let first_profile = profiles.first().cloned();
     let active_profile = Arc::new(std::sync::RwLock::new(first_profile));
+
+    // 启动 Watchdog 自动增量索引守护线程
+    watcher::start_watcher(db.clone(), active_profile.clone());
 
     // 创建 Tokio runtime
     let rt = tokio::runtime::Builder::new_multi_thread()

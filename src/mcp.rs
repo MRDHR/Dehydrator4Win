@@ -96,7 +96,7 @@ impl McpServer {
     }
 
     /// 处理 JSON-RPC 请求并生成可能的响应
-    pub fn handle_request(&self, raw_request: &str) -> Option<JsonRpcResponse> {
+    pub fn handle_request(&self, raw_request: &str, agent_type: &str) -> Option<JsonRpcResponse> {
         let req: JsonRpcRequest = match serde_json::from_str(raw_request) {
             Ok(r) => r,
             Err(e) => {
@@ -121,7 +121,7 @@ impl McpServer {
                 None
             }
             "tools/list" => Some(self.handle_tools_list(req.id)),
-            "tools/call" => Some(self.handle_tools_call(req.params, req.id)),
+            "tools/call" => Some(self.handle_tools_call(req.params, req.id, agent_type)),
             _ => Some(JsonRpcResponse {
                 jsonrpc: "2.0".to_string(),
                 result: None,
@@ -205,7 +205,7 @@ impl McpServer {
         }
     }
 
-    fn handle_tools_call(&self, params: serde_json::Value, id: Option<serde_json::Value>) -> JsonRpcResponse {
+    fn handle_tools_call(&self, params: serde_json::Value, id: Option<serde_json::Value>, agent_type: &str) -> JsonRpcResponse {
         let call_params: ToolCallParams = match serde_json::from_value(params) {
             Ok(p) => p,
             Err(e) => {
@@ -226,7 +226,7 @@ impl McpServer {
 
         match call_params.name.as_str() {
             "list_files" => self.execute_list_files(id),
-            "read_file" => self.execute_read_file(call_params.arguments, id),
+            "read_file" => self.execute_read_file(call_params.arguments, id, agent_type),
             "search_symbols" => self.execute_search_symbols(call_params.arguments, id),
             _ => JsonRpcResponse {
                 jsonrpc: "2.0".to_string(),
@@ -300,7 +300,7 @@ impl McpServer {
         }
     }
 
-    fn execute_read_file(&self, arguments: serde_json::Value, id: Option<serde_json::Value>) -> JsonRpcResponse {
+    fn execute_read_file(&self, arguments: serde_json::Value, id: Option<serde_json::Value>, agent_type: &str) -> JsonRpcResponse {
         let path_str = match arguments.get("path").or_else(|| arguments.get("absolute_path")).and_then(|v| v.as_str()) {
             Some(p) => p,
             None => {
@@ -358,7 +358,12 @@ impl McpServer {
             guard.as_ref().map(|p| p.max_file_read_lines).unwrap_or(500)
         };
 
+        let profile_opt = self.active_profile.read().unwrap().clone();
+        let profile_name = profile_opt.as_ref().map(|p| p.name.as_str()).unwrap_or("default");
+
+        let raw_tokens = (content.len() / 3) as i64;
         let line_count = content.lines().count();
+
         if line_count > max_lines {
             // 大文件触发正则脱水算法
             let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
@@ -366,6 +371,9 @@ impl McpServer {
 
             // 估计节省的 Token 数量 (代码字符数减少 / 3)
             let saved_tokens = content.len().saturating_sub(dehydrated_content.len()) / 3;
+            let optimized_tokens = (dehydrated_content.len() / 3) as i64;
+
+            let _ = self.db.insert_token_analytics(profile_name, agent_type, raw_tokens, optimized_tokens);
 
             self.log(format!(
                 "[MCP] Intercepted oversized read: {} ({} lines). Dehydrating to save estimated {} tokens.",
@@ -398,6 +406,7 @@ impl McpServer {
                 id,
             }
         } else {
+            let _ = self.db.insert_token_analytics(profile_name, agent_type, raw_tokens, raw_tokens);
             self.log(format!("[MCP] Read file directly: {} ({} lines)", path_str, line_count));
             JsonRpcResponse {
                 jsonrpc: "2.0".to_string(),
@@ -496,7 +505,7 @@ pub async fn run_mcp_stdio_server(
             break;
         }
 
-        if let Some(resp) = server.handle_request(&line) {
+        if let Some(resp) = server.handle_request(&line, "Claude") {
             if let Ok(resp_str) = serde_json::to_string(&resp) {
                 let mut resp_line = resp_str;
                 resp_line.push('\n');
@@ -682,7 +691,22 @@ pub async fn run_mcp_server(
                                 let mut body = vec![0u8; content_length];
                                 if buf_reader.read_exact(&mut body).await.is_ok() {
                                     let body_str = String::from_utf8_lossy(&body);
-                                    if let Some(resp) = server_clone.handle_request(&body_str) {
+                                    let mut user_agent = String::new();
+                                    for h in &headers {
+                                        let h_lower = h.to_lowercase();
+                                        if h_lower.starts_with("user-agent:") {
+                                            if let Some(pos) = h.find(':') {
+                                                user_agent = h[pos + 1..].trim().to_string();
+                                            }
+                                        }
+                                    }
+                                    let agent_type = if user_agent.is_empty() {
+                                        "OpenCode"
+                                    } else {
+                                        map_user_agent(&user_agent)
+                                    };
+
+                                    if let Some(resp) = server_clone.handle_request(&body_str, agent_type) {
                                         if let Ok(resp_str) = serde_json::to_string(&resp) {
                                             if uri.starts_with("/message") {
                                                 let mut sent = false;
@@ -737,7 +761,7 @@ pub async fn run_mcp_server(
                                 continue;
                             }
                         } else {
-                            if let Some(resp) = server_clone.handle_request(&line) {
+                            if let Some(resp) = server_clone.handle_request(&line, "Claude") {
                                 if let Ok(resp_str) = serde_json::to_string(&resp) {
                                     let mut resp_line = resp_str;
                                     resp_line.push('\n');
@@ -753,7 +777,7 @@ pub async fn run_mcp_server(
                                 if n == 0 {
                                     break;
                                 }
-                                if let Some(resp) = server_clone.handle_request(&line) {
+                                if let Some(resp) = server_clone.handle_request(&line, "Claude") {
                                     if let Ok(resp_str) = serde_json::to_string(&resp) {
                                         let mut resp_line = resp_str;
                                         resp_line.push('\n');
@@ -773,6 +797,19 @@ pub async fn run_mcp_server(
             }
             let _ = server_clone.ui_tx.send(McpEvent::Log("[MCP] Client disconnected".to_string()));
         });
+    }
+}
+
+fn map_user_agent(ua: &str) -> &'static str {
+    let ua_lower = ua.to_lowercase();
+    if ua_lower.contains("codex") || ua_lower.contains("vscode") || ua_lower.contains("copilot") {
+        "Codex"
+    } else if ua_lower.contains("claude") || ua_lower.contains("cline") || ua_lower.contains("anthropic") {
+        "Claude"
+    } else if ua_lower.contains("gemini") || ua_lower.contains("google") {
+        "Gemini"
+    } else {
+        "OpenCode"
     }
 }
 
@@ -797,7 +834,7 @@ mod tests {
             "id": 1
         });
         let raw_req = serde_json::to_string(&req).unwrap();
-        let raw_resp = server.handle_request(&raw_req).unwrap();
+        let raw_resp = server.handle_request(&raw_req, "Claude").unwrap();
 
         assert_eq!(raw_resp.jsonrpc, "2.0");
         assert!(raw_resp.result.is_some());
@@ -825,7 +862,7 @@ mod tests {
             "id": 2
         });
         let raw_req = serde_json::to_string(&req).unwrap();
-        let resp = server.handle_request(&raw_req).unwrap();
+        let resp = server.handle_request(&raw_req, "Claude").unwrap();
         let result = resp.result.unwrap();
         assert!(result.get("isError").unwrap().as_bool().unwrap());
         assert!(result.get("content").unwrap().as_array().unwrap()[0]
@@ -842,7 +879,7 @@ mod tests {
         };
         *active_profile.write().unwrap() = Some(profile);
 
-        let resp2 = server.handle_request(&raw_req).unwrap();
+        let resp2 = server.handle_request(&raw_req, "Claude").unwrap();
         let result2 = resp2.result.unwrap();
         assert!(result2.get("isError").is_none());
         assert!(result2.get("content").unwrap().as_array().unwrap()[0]
@@ -851,7 +888,7 @@ mod tests {
 
         // 3. 有数据测试
         db.upsert_file("test-profile-mcp", "C:/my_project/main.rs", 12345).unwrap();
-        let resp3 = server.handle_request(&raw_req).unwrap();
+        let resp3 = server.handle_request(&raw_req, "Claude").unwrap();
         let result3 = resp3.result.unwrap();
         let text3 = result3.get("content").unwrap().as_array().unwrap()[0]
             .get("text").unwrap().as_str().unwrap();
@@ -904,7 +941,7 @@ mod tests {
         });
 
         let raw_req = serde_json::to_string(&req).unwrap();
-        let resp = server.handle_request(&raw_req).unwrap();
+        let resp = server.handle_request(&raw_req, "Claude").unwrap();
         let result = resp.result.unwrap();
         let text = result.get("content").unwrap().as_array().unwrap()[0]
             .get("text").unwrap().as_str().unwrap();
@@ -917,7 +954,7 @@ mod tests {
             guard.as_mut().unwrap().max_file_read_lines = 10;
         }
 
-        let resp2 = server.handle_request(&raw_req).unwrap();
+        let resp2 = server.handle_request(&raw_req, "Claude").unwrap();
         let result2 = resp2.result.unwrap();
         let text2 = result2.get("content").unwrap().as_array().unwrap()[0]
             .get("text").unwrap().as_str().unwrap();

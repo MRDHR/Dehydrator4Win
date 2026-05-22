@@ -1,10 +1,10 @@
 use crate::config::Profile;
-use crate::storage::CodeGraph;
+use crate::storage::{CodeGraph, TimeFrameFilter, ChartDataPoint};
 use crate::mcp::McpEvent;
 use iced::widget::{button, column, container, row, scrollable, text, vertical_space, text_input};
 use iced::Subscription;
 use iced::font::Weight;
-use iced::{Element, Length, Theme, Task};
+use iced::{Element, Length, Theme, Task, Event};
 use std::sync::Arc;
 
 static MCP_RECEIVER: std::sync::OnceLock<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<McpEvent>>> = std::sync::OnceLock::new();
@@ -28,6 +28,15 @@ pub enum UiMessage {
     AddFolderToProfile,
     /// 物理存盘所有 Profile
     SaveConfig,
+    /// 全局事件（用于拦截按键缩放）
+    EventOccurred(Event),
+    /// 切换时序数据的时间过滤器
+    ChangeTimeFrame(TimeFrameFilter),
+    StartDateChanged(String),
+    EndDateChanged(String),
+    ApplyDateRange,
+    /// 触发多智能体 Skill 注入
+    TriggerSkillInjection,
 }
 
 pub struct DehydratorApp {
@@ -39,6 +48,13 @@ pub struct DehydratorApp {
     system_logs: Vec<String>,
     new_profile_input: String,
     is_scanning: Option<String>,
+    scale_factor: f32,
+    active_filter: TimeFrameFilter,
+    start_date_input: String,
+    end_date_input: String,
+    date_range_error: Option<String>,
+    chart_data: Vec<ChartDataPoint>,
+    canvas_cache: iced::widget::canvas::Cache,
 }
 
 impl DehydratorApp {
@@ -53,6 +69,13 @@ impl DehydratorApp {
             *mcp_profile_ref.write().unwrap() = Some(p.clone());
         }
 
+        let initial_filter = TimeFrameFilter::Today;
+        let initial_data = if let Some(ref name) = active_profile {
+            db.get_token_analytics_v3(name, initial_filter, None).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         (
             Self {
                 db,
@@ -66,6 +89,13 @@ impl DehydratorApp {
                 ],
                 new_profile_input: String::new(),
                 is_scanning: None,
+                scale_factor: 1.0,
+                active_filter: initial_filter,
+                start_date_input: String::new(),
+                end_date_input: String::new(),
+                date_range_error: None,
+                chart_data: initial_data,
+                canvas_cache: iced::widget::canvas::Cache::new(),
             },
             Task::none(),
         )
@@ -77,6 +107,20 @@ impl DehydratorApp {
 
     pub fn theme(&self) -> Theme {
         Theme::Dark
+    }
+
+    fn reload_telemetry(&mut self) {
+        if let Some(ref name) = self.active_profile {
+            let date_range = if self.active_filter == TimeFrameFilter::DateRange {
+                Some((self.start_date_input.clone(), self.end_date_input.clone()))
+            } else {
+                None
+            };
+            if let Ok(data) = self.db.get_token_analytics_v3(name, self.active_filter, date_range) {
+                self.chart_data = data;
+                self.canvas_cache.clear();
+            }
+        }
     }
 
     pub fn update(&mut self, message: UiMessage) -> Task<UiMessage> {
@@ -98,6 +142,7 @@ impl DehydratorApp {
                 if self.system_logs.len() > 150 {
                     self.system_logs.remove(0);
                 }
+                self.reload_telemetry();
             }
             UiMessage::SelectProfile(name) => {
                 if let Some(profile) = self.profiles.iter().find(|p| p.name == name) {
@@ -107,6 +152,7 @@ impl DehydratorApp {
                         "[SYSTEM] Dynamically switched active profile to '{}' (context redirected).",
                         name
                     ));
+                    self.reload_telemetry();
                 }
             }
             UiMessage::ScanWorkspace(name) => {
@@ -190,6 +236,7 @@ impl DehydratorApp {
                         *self.mcp_profile_ref.write().unwrap() = Some(new_profile);
                         self.system_logs.push(format!("[SYSTEM] Created new workspace profile '{}'.", name));
                         self.new_profile_input.clear();
+                        self.reload_telemetry();
                         // 自动触发物理存盘
                         return Task::done(UiMessage::SaveConfig);
                     } else {
@@ -254,12 +301,82 @@ impl DehydratorApp {
                     self.system_logs.push("[SYSTEM] All configuration profiles saved to YAML successfully.".to_string());
                 }
             }
+            UiMessage::EventOccurred(event) => {
+                if let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) = event {
+                    if modifiers.control() {
+                        match key.as_ref() {
+                            iced::keyboard::Key::Character("=") | iced::keyboard::Key::Character("+") => {
+                                self.scale_factor = (self.scale_factor + 0.1).min(2.5);
+                                self.system_logs.push(format!("[SYSTEM] Zoom in: scale factor set to {:.1}", self.scale_factor));
+                            }
+                            iced::keyboard::Key::Character("-") => {
+                                self.scale_factor = (self.scale_factor - 0.1).max(0.6);
+                                self.system_logs.push(format!("[SYSTEM] Zoom out: scale factor set to {:.1}", self.scale_factor));
+                            }
+                            iced::keyboard::Key::Character("0") => {
+                                self.scale_factor = 1.0;
+                                self.system_logs.push("[SYSTEM] Reset zoom: scale factor set to 1.0".to_string());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            UiMessage::ChangeTimeFrame(filter) => {
+                self.active_filter = filter;
+                self.date_range_error = None;
+                self.reload_telemetry();
+            }
+            UiMessage::StartDateChanged(val) => {
+                self.start_date_input = val;
+            }
+            UiMessage::EndDateChanged(val) => {
+                self.end_date_input = val;
+            }
+            UiMessage::ApplyDateRange => {
+                let date_regex = regex::Regex::new(r"^\d{4}-\d{2}-\d{2}$").unwrap();
+                if !date_regex.is_match(&self.start_date_input) || !date_regex.is_match(&self.end_date_input) {
+                    self.date_range_error = Some("Format must be YYYY-MM-DD".to_string());
+                } else {
+                    self.date_range_error = None;
+                    self.reload_telemetry();
+                }
+            }
+            UiMessage::TriggerSkillInjection => {
+                if let Some(ref name) = self.active_profile {
+                    if let Some(profile) = self.profiles.iter().find(|p| p.name == *name) {
+                        let mut success_count = 0;
+                        for ws in &profile.workspaces {
+                            if let Err(e) = crate::indexer::inject_skills(&ws.path) {
+                                self.system_logs.push(format!(
+                                    "[ERROR] Failed to inject skills to {:?}: {}",
+                                    ws.path, e
+                                ));
+                            } else {
+                                success_count += 1;
+                                self.system_logs.push(format!(
+                                    "[SYSTEM] AI skills injected successfully into workspace: {:?}",
+                                    ws.path
+                                ));
+                            }
+                        }
+                        if success_count > 0 {
+                            self.system_logs.push(format!(
+                                "[SYSTEM] Skill injection complete. Target folders: .codex, .claude, .gemini, .agent"
+                            ));
+                        }
+                    }
+                }
+            }
         }
         Task::none()
     }
 
     pub fn subscription(&self) -> Subscription<UiMessage> {
-        Subscription::run(Self::mcp_event_stream)
+        Subscription::batch(vec![
+            Subscription::run(Self::mcp_event_stream),
+            iced::event::listen().map(UiMessage::EventOccurred),
+        ])
     }
 
     fn mcp_event_stream() -> impl iced::futures::Stream<Item = UiMessage> {
@@ -277,6 +394,16 @@ impl DehydratorApp {
     }
 
     pub fn view(&self) -> Element<'_, UiMessage> {
+        let total_raw_sum: f32 = self.chart_data.iter().map(|p| p.raw_val).sum();
+        let total_opt_sum: f32 = self.chart_data.iter().map(|p| p.optimized_val).sum();
+        let saved_margin = total_raw_sum - total_opt_sum;
+
+        let efficiency_ratio = if total_raw_sum > 0.0 {
+            (saved_margin / total_raw_sum) * 100.0
+        } else {
+            0.0
+        };
+
         // --- 1. 构建 Scrollable Profiles 列表卡片 ---
         let mut profiles_col = column![].spacing(10);
 
@@ -561,26 +688,107 @@ impl DehydratorApp {
             });
 
         // --- 3. 右侧顶部 Token 看板 ---
-        let token_saved_text = text(format!("{}", self.total_token_saved))
+        let token_saved_text: iced::widget::Text<'_, iced::Theme, iced::Renderer> = text(format!("{}", self.total_token_saved))
             .size(54)
             .font(iced::Font { weight: Weight::Bold, ..Default::default() })
             .color(iced::Color::from_rgb(0.0, 1.0, 0.4));
 
+        let activate_skills_btn = button(
+            text("ACTIVATE AI SKILLS")
+                .size(12)
+                .font(iced::Font { weight: Weight::Bold, ..Default::default() })
+        )
+        .padding(iced::Padding { top: 10.0, right: 16.0, bottom: 10.0, left: 16.0 })
+        .style(|_theme, status| {
+            iced::widget::button::Style {
+                background: match status {
+                    iced::widget::button::Status::Hovered => Some(iced::Background::Color(iced::Color::from_rgba(0.0, 1.0, 0.5, 0.15))),
+                    _ => Some(iced::Background::Color(iced::Color::from_rgba(0.0, 1.0, 0.5, 0.05))),
+                },
+                border: iced::Border {
+                    color: match status {
+                        iced::widget::button::Status::Hovered => iced::Color::from_rgb(0.0, 1.0, 0.5),
+                        _ => iced::Color::from_rgba(0.0, 1.0, 0.5, 0.4),
+                    },
+                    width: 1.5,
+                    radius: 6.0.into(),
+                },
+                text_color: iced::Color::from_rgb(0.0, 1.0, 0.5),
+                ..Default::default()
+            }
+        })
+        .on_press(UiMessage::TriggerSkillInjection);
+
+        let h_style = |f| if self.active_filter == f { iced::Color::from_rgb(0.0, 1.0, 0.5) } else { iced::Color::WHITE };
+
+        let period_selectors = row![
+            button(text("24H").size(10)).style(move |_,_| iced::widget::button::Style { text_color: h_style(TimeFrameFilter::Today), ..Default::default() }).on_press(UiMessage::ChangeTimeFrame(TimeFrameFilter::Today)).padding(5),
+            button(text("3D").size(10)).style(move |_,_| iced::widget::button::Style { text_color: h_style(TimeFrameFilter::ThreeDays), ..Default::default() }).on_press(UiMessage::ChangeTimeFrame(TimeFrameFilter::ThreeDays)).padding(5),
+            button(text("7D").size(10)).style(move |_,_| iced::widget::button::Style { text_color: h_style(TimeFrameFilter::OneWeek), ..Default::default() }).on_press(UiMessage::ChangeTimeFrame(TimeFrameFilter::OneWeek)).padding(5),
+            button(text("15D").size(10)).style(move |_,_| iced::widget::button::Style { text_color: h_style(TimeFrameFilter::FifteenDays), ..Default::default() }).on_press(UiMessage::ChangeTimeFrame(TimeFrameFilter::FifteenDays)).padding(5),
+            button(text("30D").size(10)).style(move |_,_| iced::widget::button::Style { text_color: h_style(TimeFrameFilter::ThirtyDays), ..Default::default() }).on_press(UiMessage::ChangeTimeFrame(TimeFrameFilter::ThirtyDays)).padding(5),
+        ].spacing(4);
+
         let token_saved_box = container(
-            column![
-                text("TOTAL TOKENS INTERCEPTED")
-                    .size(12)
-                    .font(iced::Font { weight: Weight::Bold, ..Default::default() })
-                    .color(iced::Color::from_rgb(0.65, 0.65, 0.65)),
-                vertical_space().height(8),
-                token_saved_text,
-                vertical_space().height(4),
-                text("Estimated savings from physically bypassing function/method implementations")
-                    .size(11)
-                    .color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
+            row![
+                column![
+                    text("TOTAL TOKENS INTERCEPTED").size(11).font(iced::Font { weight: Weight::Bold, ..Default::default() }).color(iced::Color::from_rgb(0.65, 0.65, 0.65)),
+                    vertical_space().height(4),
+                    token_saved_text,
+                    vertical_space().height(2),
+                    text("Bypassed redundancy metrics via native code dehydration.").size(10).color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
+                ].width(Length::FillPortion(4)),
+                
+                column![
+                    text(format!("Raw Overhead Ceiling: {:.0}", total_raw_sum)).size(11).color(iced::Color::from_rgb(0.5, 0.7, 1.0)),
+                    text(format!("Dehydrated Spent Floor: {:.0}", total_opt_sum)).size(11).color(iced::Color::from_rgb(0.0, 1.0, 0.5)),
+                    text(format!("Net Intercept Efficiency: {:.1}%", efficiency_ratio)).size(11).color(iced::Color::from_rgb(1.0, 0.8, 0.0)),
+                ].width(Length::FillPortion(3)).spacing(6),
+
+                column![
+                    period_selectors,
+                    vertical_space().height(12),
+                    activate_skills_btn
+                ]
+                .width(Length::FillPortion(3))
+                .align_x(iced::Alignment::End)
             ]
+            .align_y(iced::Alignment::Center)
         )
         .padding(20)
+        .width(Length::Fill)
+        .style(|_| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb8(34, 37, 41))),
+            border: iced::Border {
+                color: iced::Color::from_rgb8(45, 48, 53),
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            ..Default::default()
+        });
+
+        // --- 3.5. 遥测图表组件 ---
+        let chart_header = row![
+            text("TOKEN TELEMETRY ANALYTICS")
+                .size(11)
+                .font(iced::Font { weight: Weight::Bold, ..Default::default() })
+                .color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
+        ]
+        .align_y(iced::Alignment::Center)
+        .width(Length::Fill);
+
+        let canvas_widget = iced::widget::canvas(crate::chart::TelemetryCanvas::new(&self.canvas_cache, &self.chart_data))
+            .width(Length::Fill)
+            .height(200);
+
+        let chart_box = container(
+            column![
+                chart_header,
+                vertical_space().height(10),
+                canvas_widget
+            ]
+        )
+        .padding(15)
         .width(Length::Fill)
         .style(|_| container::Style {
             background: Some(iced::Background::Color(iced::Color::from_rgb8(34, 37, 41))),
@@ -615,10 +823,17 @@ impl DehydratorApp {
         }
 
         let log_box = container(
-            scrollable(log_col)
-                .height(Length::Fill)
+            scrollable(
+                container(log_col)
+                    .padding(iced::Padding {
+                        top: 10.0,
+                        bottom: 10.0,
+                        left: 15.0,
+                        right: 15.0,
+                    })
+            )
+            .height(Length::Fill)
         )
-        .padding(15)
         .width(Length::Fill)
         .height(Length::Fill)
         .style(|_| container::Style {
@@ -634,6 +849,8 @@ impl DehydratorApp {
 
         let main_content = column![
             token_saved_box,
+            vertical_space().height(15),
+            chart_box,
             vertical_space().height(15),
             text("STREAMING GATEWAY AUDIT LOGS")
                     .size(11)
@@ -661,6 +878,8 @@ impl DehydratorApp {
     }
 }
 
+
+
 /// 启动 Iced 渲染面板的外部接口。接管当前主线程。
 pub fn run_ui(
     db: Arc<CodeGraph>,
@@ -674,7 +893,12 @@ pub fn run_ui(
         DehydratorApp::update,
         DehydratorApp::view,
     )
+    .window(iced::window::Settings {
+        position: iced::window::Position::Centered,
+        ..Default::default()
+    })
     .subscription(DehydratorApp::subscription)
     .theme(DehydratorApp::theme)
+    .scale_factor(move |state| state.scale_factor as f64)
     .run_with(move || DehydratorApp::new(db, profiles, mcp_profile_ref))
 }
