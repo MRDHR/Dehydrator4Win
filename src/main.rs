@@ -17,9 +17,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. 命令行参数解析
     let args: Vec<String> = std::env::args().collect();
     let headless = args.contains(&"--headless".to_string());
-    
+
     if args.contains(&"--debug-scan".to_string()) {
         return debug_scan::run_debug_scan();
+    }
+
+    // --workspace <path> 指定工作目录（headless/stdio 模式下用于多工程切换）
+    if let Some(ws_idx) = args.iter().position(|a| a == "--workspace") {
+        if let Some(ws_path) = args.get(ws_idx + 1) {
+            std::env::set_current_dir(ws_path)?;
+        }
     }
 
     // 2. 查找或就地创建 config 目录并加载所有的 profile

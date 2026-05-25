@@ -826,6 +826,7 @@ impl DehydratorApp {
                     .font(iced::Font::MONOSPACE)
                     .color(color)
                     .width(Length::Fill)
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
             );
         }
 
