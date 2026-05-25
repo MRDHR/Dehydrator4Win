@@ -805,13 +805,19 @@ impl DehydratorApp {
         let mut log_col = column![].spacing(3);
         for log in &self.system_logs {
             let color = if log.contains("[INTERCEPTED]") {
-                iced::Color::from_rgb(0.0, 1.0, 0.5)
+                iced::Color::from_rgb(0.0, 1.0, 0.5)           // 亮绿 - 拦截事件
             } else if log.contains("[ERROR]") {
-                iced::Color::from_rgb(1.0, 0.3, 0.3)
+                iced::Color::from_rgb(1.0, 0.3, 0.3)           // 红色 - 错误
+            } else if log.contains("[MCP/HTTP]") {
+                iced::Color::from_rgb(0.2, 0.6, 1.0)           // 蓝色 - Claude Desktop (Streamable HTTP)
+            } else if log.contains("[MCP/SSE]") {
+                iced::Color::from_rgb(1.0, 0.6, 0.1)           // 橙色 - Codex (SSE)
+            } else if log.contains("[MCP/TCP]") {
+                iced::Color::from_rgb(0.7, 0.4, 1.0)           // 紫色 - 原始 TCP
             } else if log.contains("[SYSTEM]") {
-                iced::Color::from_rgb(0.2, 0.6, 1.0)
+                iced::Color::from_rgb(0.4, 0.8, 1.0)           // 青色 - 系统消息
             } else {
-                iced::Color::from_rgb(0.5, 0.7, 0.5)
+                iced::Color::from_rgb(0.5, 0.65, 0.5)          // 暗绿 - MCP 普通日志
             };
 
             log_col = log_col.push(

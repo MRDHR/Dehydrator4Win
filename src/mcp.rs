@@ -587,6 +587,7 @@ pub async fn run_mcp_server(
             let _ = server_clone.ui_tx.send(McpEvent::Log("[MCP] Client connected".to_string()));
             let (reader, mut writer) = tokio::io::split(socket);
             let mut buf_reader = BufReader::new(reader);
+            let mut detected_transport: Option<&'static str> = None;
 
             loop {
                 let mut line = String::new();
@@ -650,6 +651,12 @@ pub async fn run_mcp_server(
                                 && (uri.starts_with("/sse") || (is_sse_accept && !is_streamable_post));
 
                             if is_streamable_post {
+                                if detected_transport != Some("HTTP") {
+                                    detected_transport = Some("HTTP");
+                                    let _ = server_clone.ui_tx.send(McpEvent::Log(
+                                        "[MCP/HTTP] Claude Desktop connected via Streamable HTTP".to_string()
+                                    ));
+                                }
                                 // Read body
                                 let mut content_length = 0usize;
                                 for h in &headers {
@@ -696,6 +703,9 @@ pub async fn run_mcp_server(
 
                             } else if is_sse_request {
                                 // ── Legacy SSE path kept for backwards compat ──
+                                let _ = server_clone.ui_tx.send(McpEvent::Log(
+                                    "[MCP/SSE] Codex client connected via SSE transport".to_string()
+                                ));
                                 let conn_id = CONNECTION_ID_COUNTER.fetch_add(1, Ordering::SeqCst).to_string();
                                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
                                 {
@@ -723,6 +733,9 @@ pub async fn run_mcp_server(
 
                             } else if method == "POST" && uri.starts_with("/message") {
                                 // ── Legacy SSE message endpoint ──
+                                if detected_transport != Some("SSE") {
+                                    detected_transport = Some("SSE");
+                                }
                                 let conn_id = if let Some(pos) = uri.find("connection_id=") {
                                     uri[pos + 14..].split('&').next().map(|s| s.to_string())
                                 } else { None };
@@ -777,6 +790,12 @@ pub async fn run_mcp_server(
                             }
 
                         } else {
+                            // Raw TCP (non-HTTP) connection
+                            if detected_transport.is_none() {
+                                let _ = server_clone.ui_tx.send(McpEvent::Log(
+                                    "[MCP/TCP] Raw TCP client connected".to_string()
+                                ));
+                            }
                             if let Some(resp) = server_clone.handle_request(&line, "Claude") {
                                 if let Ok(resp_str) = serde_json::to_string(&resp) {
                                     let mut resp_line = resp_str;
