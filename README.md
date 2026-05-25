@@ -107,5 +107,46 @@ This runs the MCP server on stdio and starts the 127.0.0.1:3001 TCP host without
 
 ---
 
-## License
+## MCP Client Integration
+
+Dehydrator4Win supports **two MCP transport modes** on the same port `127.0.0.1:3001`:
+
+| Client | Transport | Endpoint |
+|---|---|---|
+| Claude Desktop (Anthropic) | Streamable HTTP (2025-03-26 spec) | `http://127.0.0.1:3001/mcp` |
+| GPT / OpenAI | HTTP+SSE (2024-11-05 spec) | `http://127.0.0.1:3001/sse` |
+| Custom stdio agents | stdio | Run with `--headless` |
+
+### Claude Desktop
+Add the following to your `claude_desktop_config.json`:
+```json
+{
+  "mcpServers": {
+    "dehydrator4win": {
+      "type": "http",
+      "url": "http://127.0.0.1:3001/mcp"
+    }
+  }
+}
+```
+
+### GPT / OpenAI (SSE)
+Use the SSE endpoint:
+```
+http://127.0.0.1:3001/sse
+```
+
+### Cursor / VS Code (stdio)
+Add to your MCP config:
+```json
+{
+  "mcpServers": {
+    "dehydrator4win": {
+      "command": "C:/path/to/Dehydrator4Win.exe",
+      "args": ["--headless"]
+    }
+  }
+}
+```
+
 Licensed under the Apache License 2.0. Feel free to contribute or submit PRs!

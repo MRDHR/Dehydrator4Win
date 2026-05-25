@@ -107,5 +107,49 @@ target/release/Dehydrator4Win.exe --headless
 
 ---
 
+## MCP 客户端接入配置
+
+Dehydrator4Win 在同一个端口 `127.0.0.1:3001` 上**同时支持两种 MCP 传输协议**：
+
+| 客户端 | 传输协议 | 接入端点 |
+|---|---|---|
+| Claude Desktop（Anthropic） | Streamable HTTP（2025-03-26 规范） | `http://127.0.0.1:3001/mcp` |
+| GPT / OpenAI | HTTP+SSE（2024-11-05 规范） | `http://127.0.0.1:3001/sse` |
+| 自定义 stdio 智能体 | stdio 标准输入输出 | 使用 `--headless` 启动 |
+
+### Claude Desktop
+在您的 `claude_desktop_config.json` 中添加以下配置：
+```json
+{
+  "mcpServers": {
+    "dehydrator4win": {
+      "type": "http",
+      "url": "http://127.0.0.1:3001/mcp"
+    }
+  }
+}
+```
+
+### GPT / OpenAI（SSE）
+使用 SSE 协议端点：
+```
+http://127.0.0.1:3001/sse
+```
+
+### Cursor / VS Code（stdio）
+在您的 MCP 配置文件中加入：
+```json
+{
+  "mcpServers": {
+    "dehydrator4win": {
+      "command": "C:/path/to/Dehydrator4Win.exe",
+      "args": ["--headless"]
+    }
+  }
+}
+```
+
+---
+
 ## 许可证
 基于 Apache License 2.0 许可证开源，欢迎大家提 PR 或 Issue 共同改进！

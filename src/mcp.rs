@@ -634,29 +634,79 @@ pub async fn run_mcp_server(
                             }
 
                             if method == "OPTIONS" {
-                                if write_http_response(&mut writer, "200 OK", &[], "").await.is_err() {
-                                    break;
-                                }
+                                let _ = write_http_response(&mut writer, "200 OK", &[
+                                    "Allow: GET, POST, OPTIONS",
+                                ], "").await;
                                 continue;
                             }
 
-                            let is_sse_request = method == "GET" && (is_sse_accept || uri.starts_with("/sse") || uri == "/");
+                            // ── Streamable HTTP (Claude Desktop / new MCP spec 2025-03-26) ──
+                            // POST / or POST /mcp → return JSON directly in response body
+                            let is_streamable_post = method == "POST"
+                                && (uri == "/" || uri == "/mcp" || uri.starts_with("/mcp?"));
 
-                            if is_sse_request {
+                            // ── Legacy SSE endpoint (GPT / old MCP spec 2024-11-05) ──
+                            let is_sse_request = method == "GET"
+                                && (uri.starts_with("/sse") || (is_sse_accept && !is_streamable_post));
+
+                            if is_streamable_post {
+                                // Read body
+                                let mut content_length = 0usize;
+                                for h in &headers {
+                                    if h.to_lowercase().starts_with("content-length:") {
+                                        content_length = h.split(':').nth(1)
+                                            .and_then(|v| v.trim().parse().ok())
+                                            .unwrap_or(0);
+                                    }
+                                }
+                                let mut body = vec![0u8; content_length];
+                                if buf_reader.read_exact(&mut body).await.is_err() {
+                                    let _ = write_http_response(&mut writer, "400 Bad Request", &[], "Bad Request").await;
+                                    break;
+                                }
+                                let body_str = String::from_utf8_lossy(&body);
+                                let mut user_agent = String::new();
+                                for h in &headers {
+                                    if h.to_lowercase().starts_with("user-agent:") {
+                                        if let Some(pos) = h.find(':') {
+                                            user_agent = h[pos + 1..].trim().to_string();
+                                        }
+                                    }
+                                }
+                                let agent_type = if user_agent.is_empty() { "Claude" } else { map_user_agent(&user_agent) };
+
+                                if let Some(resp) = server_clone.handle_request(&body_str, agent_type) {
+                                    match serde_json::to_string(&resp) {
+                                        Ok(resp_str) => {
+                                            let _ = write_http_response(
+                                                &mut writer, "200 OK",
+                                                &["Content-Type: application/json"],
+                                                &resp_str,
+                                            ).await;
+                                        }
+                                        Err(_) => {
+                                            let _ = write_http_response(&mut writer, "500 Internal Server Error", &[], "").await;
+                                        }
+                                    }
+                                } else {
+                                    // Notification (e.g. notifications/initialized) → 202 Accepted with empty body
+                                    let _ = write_http_response(&mut writer, "202 Accepted", &["Content-Type: application/json"], "{}").await;
+                                }
+                                continue;
+
+                            } else if is_sse_request {
+                                // ── Legacy SSE path kept for backwards compat ──
                                 let conn_id = CONNECTION_ID_COUNTER.fetch_add(1, Ordering::SeqCst).to_string();
                                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-                                
                                 {
                                     let mut conns = active_connections_clone.lock().await;
                                     conns.insert(conn_id.clone(), tx);
                                 }
-
                                 if write_sse_headers(&mut writer).await.is_ok() {
                                     let endpoint_msg = format!("event: endpoint\ndata: http://{}/message?connection_id={}\n\n", host, conn_id);
                                     if writer.write_all(endpoint_msg.as_bytes()).await.is_ok() {
                                         let _ = writer.flush().await;
                                     }
-
                                     while let Some(msg) = rx.recv().await {
                                         let event_msg = format!("event: message\ndata: {}\n\n", msg);
                                         if writer.write_all(event_msg.as_bytes()).await.is_err() {
@@ -665,101 +715,67 @@ pub async fn run_mcp_server(
                                         let _ = writer.flush().await;
                                     }
                                 }
-
                                 {
                                     let mut conns = active_connections_clone.lock().await;
                                     conns.remove(&conn_id);
                                 }
                                 break;
-                            } else if method == "POST" {
+
+                            } else if method == "POST" && uri.starts_with("/message") {
+                                // ── Legacy SSE message endpoint ──
                                 let conn_id = if let Some(pos) = uri.find("connection_id=") {
                                     uri[pos + 14..].split('&').next().map(|s| s.to_string())
-                                } else {
-                                    None
-                                };
+                                } else { None };
 
-                                let mut content_length = 0;
+                                let mut content_length = 0usize;
                                 for h in &headers {
-                                    let h_lower = h.to_lowercase();
-                                    if h_lower.starts_with("content-length:") {
-                                        if let Some(val_str) = h.split(':').nth(1) {
-                                            content_length = val_str.trim().parse::<usize>().unwrap_or(0);
-                                        }
+                                    if h.to_lowercase().starts_with("content-length:") {
+                                        content_length = h.split(':').nth(1)
+                                            .and_then(|v| v.trim().parse().ok())
+                                            .unwrap_or(0);
                                     }
                                 }
-
                                 let mut body = vec![0u8; content_length];
-                                if buf_reader.read_exact(&mut body).await.is_ok() {
-                                    let body_str = String::from_utf8_lossy(&body);
-                                    let mut user_agent = String::new();
-                                    for h in &headers {
-                                        let h_lower = h.to_lowercase();
-                                        if h_lower.starts_with("user-agent:") {
-                                            if let Some(pos) = h.find(':') {
-                                                user_agent = h[pos + 1..].trim().to_string();
-                                            }
-                                        }
-                                    }
-                                    let agent_type = if user_agent.is_empty() {
-                                        "OpenCode"
-                                    } else {
-                                        map_user_agent(&user_agent)
-                                    };
-
-                                    if let Some(resp) = server_clone.handle_request(&body_str, agent_type) {
-                                        if let Ok(resp_str) = serde_json::to_string(&resp) {
-                                            if uri.starts_with("/message") {
-                                                let mut sent = false;
-                                                if let Some(ref cid) = conn_id {
-                                                    let conns = active_connections_clone.lock().await;
-                                                    if let Some(tx) = conns.get(cid) {
-                                                        let _ = tx.send(resp_str.clone());
-                                                        sent = true;
-                                                    }
-                                                }
-                                                if !sent {
-                                                    let conns = active_connections_clone.lock().await;
-                                                    if let Some(tx) = conns.values().next() {
-                                                        let _ = tx.send(resp_str);
-                                                    }
-                                                }
-                                                if write_http_response(&mut writer, "200 OK", &[], "OK").await.is_err() {
-                                                    break;
-                                                }
-                                            } else {
-                                                // Streamable HTTP: return JSON response directly in POST response body
-                                                if write_http_response(
-                                                    &mut writer,
-                                                    "200 OK",
-                                                    &["Content-Type: application/json"],
-                                                    &resp_str,
-                                                ).await.is_err() {
-                                                    break;
-                                                }
-                                            }
-                                        } else {
-                                            if write_http_response(&mut writer, "500 Internal Error", &[], "Internal Error").await.is_err() {
-                                                break;
-                                            }
-                                        }
-                                    } else {
-                                        // Notification request (e.g. notifications/initialized), return 202 Accepted/200 OK
-                                        if write_http_response(&mut writer, "202 Accepted", &[], "").await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                } else {
-                                    if write_http_response(&mut writer, "400 Bad Request", &[], "Bad Request").await.is_err() {
-                                        break;
-                                    }
-                                }
-                                continue;
-                            } else {
-                                if write_http_response(&mut writer, "404 Not Found", &[], "Not Found").await.is_err() {
+                                if buf_reader.read_exact(&mut body).await.is_err() {
+                                    let _ = write_http_response(&mut writer, "400 Bad Request", &[], "Bad Request").await;
                                     break;
                                 }
+                                let body_str = String::from_utf8_lossy(&body);
+                                let mut user_agent = String::new();
+                                for h in &headers {
+                                    if h.to_lowercase().starts_with("user-agent:") {
+                                        if let Some(pos) = h.find(':') {
+                                            user_agent = h[pos + 1..].trim().to_string();
+                                        }
+                                    }
+                                }
+                                let agent_type = if user_agent.is_empty() { "OpenCode" } else { map_user_agent(&user_agent) };
+
+                                if let Some(resp) = server_clone.handle_request(&body_str, agent_type) {
+                                    if let Ok(resp_str) = serde_json::to_string(&resp) {
+                                        let sent = if let Some(ref cid) = conn_id {
+                                            let conns = active_connections_clone.lock().await;
+                                            if let Some(tx) = conns.get(cid) {
+                                                let _ = tx.send(resp_str.clone());
+                                                true
+                                            } else { false }
+                                        } else { false };
+                                        if !sent {
+                                            let conns = active_connections_clone.lock().await;
+                                            if let Some(tx) = conns.values().next() {
+                                                let _ = tx.send(resp_str);
+                                            }
+                                        }
+                                    }
+                                }
+                                let _ = write_http_response(&mut writer, "200 OK", &[], "OK").await;
+                                continue;
+
+                            } else {
+                                let _ = write_http_response(&mut writer, "404 Not Found", &[], "Not Found").await;
                                 continue;
                             }
+
                         } else {
                             if let Some(resp) = server_clone.handle_request(&line, "Claude") {
                                 if let Ok(resp_str) = serde_json::to_string(&resp) {
